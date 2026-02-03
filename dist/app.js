@@ -1,0 +1,39 @@
+import { RedisClient } from "./infra/redis/redis.client.js";
+import { TokenCrypto } from "./infra/crypto/token-crypto.js";
+import { TokenStore } from "./infra/redis/token-store.js";
+import { SymbolStore } from "./infra/redis/symbol-store.js";
+import { ProtoRegistry } from "./infra/ctrader/protobuf/proto-registry.js";
+import { QuoteBus } from "./infra/ctrader/quote-bus.js";
+import { CTraderConnection } from "./infra/ctrader/ctrader-connection.js";
+import { CTraderGateway } from "./infra/ctrader/ctrader-gateway.js";
+import { OAuthService } from "./infra/oauth/oauth.service.js";
+import { HttpServer } from "./infra/http/http-server.js";
+import { registerRoutes } from "./infra/http/routes.js";
+export class App {
+    constructor(env, logger) {
+        this.env = env;
+        this.logger = logger;
+    }
+    async start() {
+        this.logger.info({}, "✅ App.start()");
+        const redisClient = new RedisClient(this.env, this.logger);
+        await redisClient.connect();
+        this.logger.info({}, "✅ Redis connected");
+        const crypto = new TokenCrypto(this.env.tokenEncryptionKey);
+        const store = new TokenStore(redisClient.redis, crypto);
+        const symbolStore = new SymbolStore(redisClient.redis, { ttlSeconds: 24 * 60 * 60 });
+        const proto = new ProtoRegistry();
+        await proto.load();
+        this.logger.info({}, "✅ Protobuf loaded");
+        const quotes = new QuoteBus();
+        const ctraderConn = new CTraderConnection(this.logger, proto);
+        await ctraderConn.start();
+        this.logger.info({}, "✅ cTrader connection started");
+        const oauth = new OAuthService(this.env, store, this.logger);
+        const gateway = new CTraderGateway(store, symbolStore, ctraderConn, quotes, this.logger);
+        const server = new HttpServer(this.env, this.logger);
+        registerRoutes(server.app, { oauth, gateway, logger: this.logger });
+        await server.listen();
+        this.logger.info({ port: this.env.port }, "✅ HTTP listening");
+    }
+}

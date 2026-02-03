@@ -1,5 +1,6 @@
-import type { FastifyInstance } from "fastify";
-import { HttpError } from "./errors.js";
+// src/infra/http/routes.ts
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { HttpError, badRequest, toHttpError } from "./errors.js";
 import type { RequestCtx } from "./http-types.js";
 
 import type { OAuthService } from "../oauth/oauth.service.js";
@@ -24,168 +25,251 @@ const ORDER_TYPES: readonly OrderType[] = [
   "MARKET_RANGE",
 ] as const;
 
+function getCtx(req: FastifyRequest): RequestCtx {
+  return (req as any).ctx as RequestCtx;
+}
+
+function mustUserId(ctx: RequestCtx, body: any): string {
+  const userId = ctx.userId || String(body?.userId ?? "").trim();
+  if (!userId) throw new HttpError(400, "x-user-id header (or body.userId) required");
+  return userId;
+}
+
 function parseSide(v: unknown): TradeSide {
-  const s = String(v ?? "").toUpperCase();
+  const s = String(v ?? "").trim().toUpperCase();
   if (s === "BUY" || s === "SELL") return s;
-  throw new HttpError(400, "side must be BUY or SELL");
+  throw badRequest("side must be BUY or SELL", { received: v });
 }
 
 function parseOrderType(v: unknown): OrderType {
-  const s = String(v ?? "").toUpperCase();
+  const s = String(v ?? "").trim().toUpperCase();
   if ((ORDER_TYPES as readonly string[]).includes(s)) return s as OrderType;
-  throw new HttpError(
-    400,
-    `orderType must be one of: ${ORDER_TYPES.join(", ")}`,
-  );
+  throw badRequest("orderType invalid", { allowed: ORDER_TYPES, received: v });
+}
+
+function clampInt(n: number, min: number, max: number): number {
+  return Math.min(Math.max(n, min), max);
+}
+
+function optNum(v: any, fieldName = "number"): number | undefined {
+  if (v === null || v === undefined || v === "") return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n)) throw badRequest(`Invalid number field: ${fieldName}`, { received: v });
+  return n;
+}
+
+function optStr(v: any): string | undefined {
+  if (v === null || v === undefined) return undefined;
+  const s = String(v).trim();
+  return s ? s : undefined;
+}
+
+/**
+ * Wraps handlers with try/catch:
+ * - normalizes unknown errors to HttpError
+ * - logs with reqId + route (no secrets)
+ * - rethrows for global errorHandler to respond consistently
+ */
+function wrap(
+  deps: Deps,
+  routeName: string,
+  handler: (req: FastifyRequest, reply: FastifyReply) => Promise<any>,
+) {
+  return async (req: FastifyRequest, reply: FastifyReply) => {
+    try {
+      return await handler(req, reply);
+    } catch (err) {
+      const httpErr = toHttpError(err);
+
+      const ctx = (req as any)?.ctx as RequestCtx | undefined;
+
+      // Avoid logging sensitive body content (oauth code, tokens, etc.)
+      const logBase = {
+        route: routeName,
+        reqId: req.id,
+        method: req.method,
+        url: req.url,
+        status: httpErr.status,
+        userId: ctx?.userId || undefined,
+        env: ctx?.env || undefined,
+      };
+
+      if (httpErr.status >= 500) {
+        deps.logger.error({ ...logBase, err }, "Route failed (server)");
+      } else {
+        deps.logger.warn({ ...logBase, err }, "Route failed (client)");
+      }
+
+      throw httpErr;
+    }
+  };
 }
 
 export function registerRoutes(app: FastifyInstance, deps: Deps) {
-  app.get("/health", async () => ({ ok: true }));
+  app.get(
+    "/health",
+    wrap(deps, "health", async () => ({ ok: true })),
+  );
 
-  app.post("/oauth/exchange", async (req) => {
-    const ctx = (req as any).ctx as RequestCtx;
-    const body = req.body as any;
+  app.post(
+    "/oauth/exchange",
+    wrap(deps, "oauth.exchange", async (req) => {
+      console.log("OAuth exchange endpoint called", req.body);
+      const ctx = getCtx(req);
+      const body = (req.body ?? {}) as any;
 
-    const userId = ctx.userId || String(body?.userId ?? "").trim();
-    const code = String(body?.code ?? "").trim();
-    if (!userId)
-      throw new HttpError(400, "x-user-id header (or body.userId) required");
-    if (!code) throw new HttpError(400, "code required");
+      const userId = mustUserId(ctx, body);
+      const code = String(body?.code ?? "").trim();
+      if (!code) throw badRequest("code required");
 
-    return deps.oauth.exchangeCodeAndStore(userId, code);
-  });
+      // DO NOT log code anywhere (wrapper already avoids body logs)
+      return deps.oauth.exchangeCodeAndStore(userId, code);
+    }),
+  );
 
-  app.post("/oauth/refresh", async (req) => {
-    const ctx = (req as any).ctx as RequestCtx;
-    const body = req.body as any;
+  app.post(
+    "/oauth/refresh",
+    wrap(deps, "oauth.refresh", async (req) => {
+      const ctx = getCtx(req);
+      const body = (req.body ?? {}) as any;
 
-    const userId = ctx.userId || String(body?.userId ?? "").trim();
-    if (!userId)
-      throw new HttpError(400, "x-user-id header (or body.userId) required");
+      const userId = mustUserId(ctx, body);
+      return deps.oauth.refreshAndStore(userId);
+    }),
+  );
 
-    return deps.oauth.refreshAndStore(userId);
-  });
+  app.get(
+    "/accounts",
+    wrap(deps, "accounts.list", async (req) => {
+      const ctx = getCtx(req);
+      if (!ctx.userId) throw badRequest("x-user-id required");
+      return deps.gateway.listAccounts(ctx.userId, ctx.env);
+    }),
+  );
 
-  app.get("/accounts", async (req) => {
-    const ctx = (req as any).ctx as RequestCtx;
-    if (!ctx.userId) throw new HttpError(400, "x-user-id required");
-    return deps.gateway.listAccounts(ctx.userId, ctx.env);
-  });
+  app.post(
+    "/auth/account",
+    wrap(deps, "auth.account", async (req) => {
+      const ctx = getCtx(req);
+      const body = (req.body ?? {}) as any;
 
-  app.post("/auth/account", async (req) => {
-    const ctx = (req as any).ctx as RequestCtx;
-    const body = req.body as any;
+      const userId = mustUserId(ctx, body);
+      const accountId = Number(body?.accountId);
 
-    const userId = ctx.userId || String(body?.userId ?? "").trim();
-    const accountId = Number(body?.accountId);
-    if (!userId)
-      throw new HttpError(400, "x-user-id header (or body.userId) required");
-    if (!Number.isFinite(accountId) || accountId <= 0)
-      throw new HttpError(400, "accountId must be a positive number");
+      if (!Number.isFinite(accountId) || accountId <= 0) {
+        throw badRequest("accountId must be a positive number", { received: body?.accountId });
+      }
 
-    return deps.gateway.authorizeAccount(userId, accountId, ctx.env);
-  });
+      return deps.gateway.authorizeAccount(userId, accountId, ctx.env);
+    }),
+  );
 
-  app.get("/symbols", async (req) => {
-    const ctx = (req as any).ctx as RequestCtx;
-    const q = String((req.query as any)?.q ?? "");
-    const limit = Number((req.query as any)?.limit ?? 200);
+  app.get(
+    "/symbols",
+    wrap(deps, "symbols.list", async (req) => {
+      const ctx = getCtx(req);
+      const q = String((req.query as any)?.q ?? "");
+      const limitRaw = Number((req.query as any)?.limit ?? 200);
 
-    if (!ctx.userId) throw new HttpError(400, "x-user-id required");
+      if (!ctx.userId) throw badRequest("x-user-id required");
 
-    return deps.gateway.listSymbols(
-      ctx.userId,
-      q,
-      Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 2000) : 200,
-      ctx.env,
-    );
-  });
+      const limit = Number.isFinite(limitRaw) ? clampInt(limitRaw, 1, 2000) : 200;
 
-  app.get("/quote", async (req) => {
-    const ctx = (req as any).ctx as RequestCtx;
-    const symbol = String((req.query as any)?.symbol ?? "").trim();
-    const wait = Number((req.query as any)?.wait ?? 0);
+      return deps.gateway.listSymbols(ctx.userId, q, limit, ctx.env);
+    }),
+  );
 
-    if (!ctx.userId) throw new HttpError(400, "x-user-id required");
-    if (!symbol) throw new HttpError(400, "symbol is required");
+  app.get(
+    "/quote",
+    wrap(deps, "quote.get", async (req) => {
+      const ctx = getCtx(req);
+      const symbol = String((req.query as any)?.symbol ?? "").trim();
+      const waitRaw = Number((req.query as any)?.wait ?? 0);
 
-    return deps.gateway.getQuote(
-      ctx.userId,
-      symbol,
-      Number.isFinite(wait) ? wait : 0,
-      ctx.env,
-    );
-  });
+      if (!ctx.userId) throw badRequest("x-user-id required");
+      if (!symbol) throw badRequest("symbol is required");
 
-  app.get("/account", async (req) => {
-    const ctx = (req as any).ctx as RequestCtx;
-    if (!ctx.userId) throw new HttpError(400, "x-user-id required");
-    return deps.gateway.getAccountInfo(ctx.userId, ctx.env);
-  });
+      const wait = Number.isFinite(waitRaw) ? Math.max(waitRaw, 0) : 0;
 
-  function optNum(v: any): number | undefined {
-    if (v === null || v === undefined || v === "") return undefined;
-    const n = Number(v);
-    if (!Number.isFinite(n)) throw new HttpError(400, "Invalid number field");
-    return n;
-  }
-  function optStr(v: any): string | undefined {
-    if (v === null || v === undefined) return undefined;
-    const s = String(v).trim();
-    return s ? s : undefined;
-  }
+      return deps.gateway.getQuote(ctx.userId, symbol, wait, ctx.env);
+    }),
+  );
 
-  app.post("/trade", async (req) => {
-    const ctx = (req as any).ctx as RequestCtx;
-    const body = req.body as any;
+  app.get(
+    "/account",
+    wrap(deps, "account.get", async (req) => {
+      const ctx = getCtx(req);
+      if (!ctx.userId) throw badRequest("x-user-id required");
+      return deps.gateway.getAccountInfo(ctx.userId, ctx.env);
+    }),
+  );
 
-    const userId = ctx.userId || String(body?.userId ?? "").trim();
-    if (!userId)
-      throw new HttpError(400, "x-user-id header (or body.userId) required");
+  app.post(
+    "/trade",
+    wrap(deps, "trade.place", async (req) => {
+      const ctx = getCtx(req);
+      const body = (req.body ?? {}) as any;
 
-    const symbol = String(body?.symbol ?? "").trim();
-    if (!symbol) throw new HttpError(400, "symbol is required");
+      const userId = mustUserId(ctx, body);
 
-    const side = parseSide(body?.side);
-    const orderType = parseOrderType(body?.orderType);
+      const symbol = String(body?.symbol ?? "").trim();
+      if (!symbol) throw badRequest("symbol is required");
 
-    const volumeUnits = Number(body?.volumeUnits);
-    if (!Number.isFinite(volumeUnits) || volumeUnits <= 0)
-      throw new HttpError(400, "volumeUnits must be > 0");
+      const side = parseSide(body?.side);
+      const orderType = parseOrderType(body?.orderType);
 
-    const accountId = optNum(body?.accountId);
-    if (accountId !== undefined && accountId <= 0)
-      throw new HttpError(400, "accountId must be a positive number");
+      const volumeUnits = Number(body?.volumeUnits);
+      if (!Number.isFinite(volumeUnits) || volumeUnits <= 0) {
+        throw badRequest("volumeUnits must be > 0", { received: body?.volumeUnits });
+      }
 
-    const limitPrice = optNum(body?.limitPrice);
-    const stopPrice = optNum(body?.stopPrice);
-    const stopLoss = optNum(body?.stopLoss);
-    const takeProfit = optNum(body?.takeProfit);
-    const stopLossDistance = optNum(body?.stopLossDistance);
-    const takeProfitDistance = optNum(body?.takeProfitDistance);
+      const accountId = optNum(body?.accountId, "accountId");
+      optNum(body?.accountId, "accountId");
+      if (accountId !== undefined && accountId <= 0) {
+        throw badRequest("accountId must be a positive number", { received: body?.accountId });
+      }
 
-    const comment = optStr(body?.comment);
-    const label = optStr(body?.label);
+      const limitPrice = optNum(body?.limitPrice, "limitPrice");
+      const stopPrice = optNum(body?.stopPrice, "stopPrice");
+      const stopLoss = optNum(body?.stopLoss, "stopLoss");
+      const takeProfit = optNum(body?.takeProfit, "takeProfit");
+      const stopLossDistance = optNum(body?.stopLossDistance, "stopLossDistance");
+      const takeProfitDistance = optNum(body?.takeProfitDistance, "takeProfitDistance");
 
-    return deps.gateway.placeTrade({
-      userId,
-      symbol,
-      side,
-      orderType,
-      volumeUnits,
+      const comment = optStr(body?.comment);
+      const label = optStr(body?.label);
 
-      ...(ctx.env ? { env: ctx.env } : {}),
-      ...(accountId !== undefined ? { accountId } : {}),
+      // Optional: basic consistency checks (safe + helpful)
+      if (orderType === "LIMIT" && limitPrice === undefined) {
+        throw badRequest("limitPrice is required for LIMIT orders");
+      }
+      if (orderType === "STOP" && stopPrice === undefined) {
+        throw badRequest("stopPrice is required for STOP orders");
+      }
+      if (orderType === "STOP_LIMIT" && (stopPrice === undefined || limitPrice === undefined)) {
+        throw badRequest("stopPrice and limitPrice are required for STOP_LIMIT orders");
+      }
 
-      ...(limitPrice !== undefined ? { limitPrice } : {}),
-      ...(stopPrice !== undefined ? { stopPrice } : {}),
-      ...(stopLoss !== undefined ? { stopLoss } : {}),
-      ...(takeProfit !== undefined ? { takeProfit } : {}),
-      ...(stopLossDistance !== undefined ? { stopLossDistance } : {}),
-      ...(takeProfitDistance !== undefined ? { takeProfitDistance } : {}),
+      return deps.gateway.placeTrade({
+        userId,
+        symbol,
+        side,
+        orderType,
+        volumeUnits,
 
-      ...(comment ? { comment } : {}),
-      ...(label ? { label } : {}),
-    });
-  });
+        ...(ctx.env ? { env: ctx.env } : {}),
+        ...(accountId !== undefined ? { accountId } : {}),
+
+        ...(limitPrice !== undefined ? { limitPrice } : {}),
+        ...(stopPrice !== undefined ? { stopPrice } : {}),
+        ...(stopLoss !== undefined ? { stopLoss } : {}),
+        ...(takeProfit !== undefined ? { takeProfit } : {}),
+        ...(stopLossDistance !== undefined ? { stopLossDistance } : {}),
+        ...(takeProfitDistance !== undefined ? { takeProfitDistance } : {}),
+
+        ...(comment ? { comment } : {}),
+        ...(label ? { label } : {}),
+      });
+    }),
+  );
 }

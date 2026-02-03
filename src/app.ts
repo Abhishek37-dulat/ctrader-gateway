@@ -1,10 +1,10 @@
-// src/app.ts
 import type { AppEnv } from "./config/env.js";
 import type { Logger } from "./infra/logger.js";
 
 import { RedisClient } from "./infra/redis/redis.client.js";
 import { TokenCrypto } from "./infra/crypto/token-crypto.js";
 import { TokenStore } from "./infra/redis/token-store.js";
+import { SymbolStore } from "./infra/redis/symbol-store.js";
 
 import { ProtoRegistry } from "./infra/ctrader/protobuf/proto-registry.js";
 import { QuoteBus } from "./infra/ctrader/quote-bus.js";
@@ -31,20 +31,20 @@ export class App {
     const crypto = new TokenCrypto(this.env.tokenEncryptionKey);
     const store = new TokenStore(redisClient.redis, crypto);
 
-    const proto = new ProtoRegistry(this.logger);
+    const symbolStore = new SymbolStore(redisClient.redis, { ttlSeconds: 24 * 60 * 60 });
+
+    const proto = new ProtoRegistry();
     await proto.load();
     this.logger.info({}, "✅ Protobuf loaded");
 
-    const quotes = new QuoteBus(this.logger);
+    const quotes = new QuoteBus();
 
-    // if your CTraderConnection signature is (logger, proto)
-    // keep it; if it's (logger, proto, quotes), then pass quotes.
     const ctraderConn = new CTraderConnection(this.logger, proto);
     await ctraderConn.start();
     this.logger.info({}, "✅ cTrader connection started");
 
     const oauth = new OAuthService(this.env, store, this.logger);
-    const gateway = new CTraderGateway(store, ctraderConn, quotes, this.logger);
+    const gateway = new CTraderGateway(store, symbolStore, ctraderConn, quotes, this.logger);
 
     const server = new HttpServer(this.env, this.logger);
     registerRoutes(server.app, { oauth, gateway, logger: this.logger });

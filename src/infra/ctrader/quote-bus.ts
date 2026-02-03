@@ -1,6 +1,5 @@
 // src/infra/ctrader/quote-bus.ts
 import { setTimeout as delay } from "node:timers/promises";
-import { Logger } from "../logger.js";
 
 export type CTraderEnv = "demo" | "live";
 
@@ -39,7 +38,7 @@ export class QuoteBus {
   // Prevent unbounded growth
   private readonly maxWaitersPerKey = 50;
 
-  constructor(private readonly logger: Logger) {}
+  constructor() {}
 
   upsert(q: Quote): void {
     const key = qkey(q.userId, q.env, q.accountId, q.symbolId);

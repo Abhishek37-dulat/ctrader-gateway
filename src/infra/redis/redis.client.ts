@@ -9,7 +9,7 @@ export class RedisClient {
     private readonly env: AppEnv,
     private readonly logger: Logger,
   ) {
-    this.redis = createClient({ url: env.redisUrl });
+    this.redis = createClient({ url: this.env.redisUrl });
 
     this.redis.on("error", (err:unknown) => {
       this.logger.error({ err }, "❌ Redis error");

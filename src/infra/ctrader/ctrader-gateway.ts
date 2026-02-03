@@ -2,9 +2,9 @@
 import type { Logger } from "../logger.js";
 import type { TokenStore } from "../redis/token-store.js";
 import type { QuoteBus, Quote } from "./quote-bus.js";
-import { SymbolCache } from "./symbol-cache.js";
 import type { CTraderConnection } from "./ctrader-connection.js";
 import type { CTraderEnv } from "../../config/env.js";
+import { SymbolStore } from "../redis/symbol-store.js";
 
 export type ListAccountsResult = Readonly<{
   count: number;
@@ -18,12 +18,7 @@ export type ListAccountsResult = Readonly<{
 }>;
 
 export type TradeSide = "BUY" | "SELL";
-export type OrderType =
-  | "MARKET"
-  | "LIMIT"
-  | "STOP"
-  | "STOP_LIMIT"
-  | "MARKET_RANGE";
+export type OrderType = "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT" | "MARKET_RANGE";
 
 export type TradeRequest = Readonly<{
   userId: string;
@@ -50,10 +45,9 @@ export type TradeRequest = Readonly<{
 }>;
 
 export class CTraderGateway {
-  private readonly symbols = new SymbolCache();
-
   constructor(
     private readonly store: TokenStore,
+    private readonly symbolStore: SymbolStore,
     private readonly ctrader: CTraderConnection,
     private readonly quotes: QuoteBus,
     private readonly logger: Logger,
@@ -70,9 +64,7 @@ export class CTraderGateway {
   private async resolveAccessToken(userId: string): Promise<string> {
     const t = await this.store.loadAccessToken(userId);
     if (!t) {
-      throw new Error(
-        "No access token available (store empty). Use /oauth/exchange first.",
-      );
+      throw new Error("No access token available (store empty). Use /oauth/exchange first.");
     }
     return t;
   }
@@ -90,10 +82,36 @@ export class CTraderGateway {
     return aid;
   }
 
+  /**
+   * cTrader requires ACCOUNT_AUTH on the same TCP/TLS channel before trade/symbol/quote calls.
+   * If we re-send it and cTrader responds "already authorized", treat it as OK.
+   */
+  private async ensureAccountAuthorized(userId: string, env: CTraderEnv, accountId: number): Promise<void> {
+    const accessToken = await this.resolveAccessToken(userId);
+
+    const res = await this.ctrader.send(
+      "PROTO_OA_ACCOUNT_AUTH_REQ",
+      { ctidTraderAccountId: accountId, accessToken },
+      12_000,
+      { userId, env, accountId },
+    );
+
+    const decoded = (res as any)?.decoded ?? res;
+    const payloadName = (res as any)?.payloadName ?? decoded?.payloadType;
+
+    if (payloadName === "PROTO_OA_ERROR_RES") {
+      const desc = String(decoded?.description ?? decoded?.message ?? "");
+      // This is the one you saw:
+      // "ACCOUNT_AUTH_ERROR: Trading account is already authorized in this channel"
+      if (desc.toLowerCase().includes("already authorized")) return;
+
+      throw new Error(desc || "ACCOUNT_AUTH_ERROR");
+    }
+  }
+
   // ---------- APIs ----------
 
   async listAccounts(userId: string, envOverride?: CTraderEnv): Promise<ListAccountsResult> {
-    // env currently only stored; connection uses global env.ctrader.env
     await this.resolveEnv(userId, envOverride);
 
     const accessToken = await this.resolveAccessToken(userId);
@@ -102,29 +120,18 @@ export class CTraderGateway {
       "PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_REQ",
       { accessToken },
       12_000,
+      { userId, env: envOverride },
     );
 
     const decoded = (res as any)?.decoded ?? res;
-    const accounts = Array.isArray(decoded?.ctidTraderAccount)
-      ? decoded.ctidTraderAccount
-      : [];
+    const accounts = Array.isArray(decoded?.ctidTraderAccount) ? decoded.ctidTraderAccount : [];
 
     return Object.freeze({ count: accounts.length, items: accounts });
   }
 
-  async authorizeAccount(
-    userId: string,
-    accountId: number,
-    envOverride?: CTraderEnv,
-  ): Promise<any> {
+  async authorizeAccount(userId: string, accountId: number, envOverride?: CTraderEnv): Promise<any> {
     const env = await this.resolveEnv(userId, envOverride);
-    const accessToken = await this.resolveAccessToken(userId);
-
-    const res = await this.ctrader.send(
-      "PROTO_OA_ACCOUNT_AUTH_REQ",
-      { ctidTraderAccountId: accountId, accessToken },
-      12_000,
-    );
+    await this.ensureAccountAuthorized(userId, env, accountId);
 
     await this.store.setActiveAccountId(userId, accountId);
     await this.store.setEnv(userId, env);
@@ -132,42 +139,30 @@ export class CTraderGateway {
     return Object.freeze({
       authorized: true,
       activeAccountId: accountId,
-      response: (res as any)?.decoded ?? res,
+      response: { payloadType: "PROTO_OA_ACCOUNT_AUTH_RES", ctidTraderAccountId: String(accountId) },
     });
   }
 
-  async listSymbols(
-    userId: string,
-    q: string,
-    limit: number,
-    envOverride?: CTraderEnv,
-  ): Promise<any> {
+  async listSymbols(userId: string, q: string, limit: number, envOverride?: CTraderEnv): Promise<any> {
     const env = await this.resolveEnv(userId, envOverride);
     const accountId = await this.resolveAccountId(userId);
 
-    let cache = this.symbols.get(userId, env, accountId);
-    if (!cache) cache = await this.refreshSymbols(userId, env, accountId);
+    await this.ensureAccountAuthorized(userId, env, accountId);
 
-    const needle = q.trim().toUpperCase();
-    const out: Array<{ symbol: string; symbolId: number }> = [];
+    // If hash is empty/missing → refresh from cTrader first
+    const cnt = await this.symbolStore.count(userId, env, accountId);
+    if (!cnt) await this.refreshSymbols(userId, env, accountId);
 
-    for (const [name, id] of cache.entries()) {
-      if (needle && !name.includes(needle)) continue;
-      out.push({ symbol: name, symbolId: id });
-      if (out.length >= limit) break;
-    }
+    const items = await this.symbolStore.search(userId, env, accountId, q, limit);
 
-    return { activeAccountId: accountId, count: out.length, items: out };
+    return { activeAccountId: accountId, count: items.length, items };
   }
 
-  async getQuote(
-    userId: string,
-    symbol: string,
-    waitSeconds: number,
-    envOverride?: CTraderEnv,
-  ): Promise<Quote> {
+  async getQuote(userId: string, symbol: string, waitSeconds: number, envOverride?: CTraderEnv): Promise<Quote> {
     const env = await this.resolveEnv(userId, envOverride);
     const accountId = await this.resolveAccountId(userId);
+
+    await this.ensureAccountAuthorized(userId, env, accountId);
 
     const symbolId = await this.ensureSymbolId(userId, env, accountId, symbol);
 
@@ -179,6 +174,7 @@ export class CTraderGateway {
         subscribeToSpotTimestamp: true,
       },
       12_000,
+      { userId, env, accountId },
     );
 
     if (!waitSeconds || waitSeconds <= 0) {
@@ -187,23 +183,20 @@ export class CTraderGateway {
       return last;
     }
 
-    return await this.quotes.waitForNext(
-      userId,
-      env,
-      accountId,
-      symbolId,
-      Math.floor(waitSeconds * 1000),
-    );
+    return await this.quotes.waitForNext(userId, env, accountId, symbolId, Math.floor(waitSeconds * 1000));
   }
 
   async getAccountInfo(userId: string, envOverride?: CTraderEnv): Promise<any> {
     const env = await this.resolveEnv(userId, envOverride);
     const accountId = await this.resolveAccountId(userId);
 
+    await this.ensureAccountAuthorized(userId, env, accountId);
+
     const res = await this.ctrader.send(
       "PROTO_OA_TRADER_REQ",
       { ctidTraderAccountId: accountId },
       12_000,
+      { userId, env, accountId },
     );
 
     return (res as any)?.decoded ?? res;
@@ -212,6 +205,9 @@ export class CTraderGateway {
   async placeTrade(req: TradeRequest): Promise<any> {
     const env = await this.resolveEnv(req.userId, req.env);
     const accountId = await this.resolveAccountId(req.userId, req.accountId);
+
+    await this.ensureAccountAuthorized(req.userId, env, accountId);
+
     const symbolId = await this.ensureSymbolId(req.userId, env, accountId, req.symbol);
 
     const orderType = req.orderType.toUpperCase() as OrderType;
@@ -219,14 +215,15 @@ export class CTraderGateway {
 
     if (side !== "BUY" && side !== "SELL") throw new Error("side must be BUY or SELL");
 
+    // cTrader: volume in 0.01 units (1000 => 10.00). (Your current scaling is OK.)
     const volume = Math.round(req.volumeUnits * 100);
     if (!Number.isFinite(volume) || volume <= 0) throw new Error("volumeUnits must be > 0");
 
     const base: Record<string, unknown> = {
       ctidTraderAccountId: accountId,
       symbolId,
-      tradeSide: side,
-      orderType,
+      orderType,   // NOTE: will be coerced to enum number in ProtoRegistry patch below
+      tradeSide: side, // same
       volume,
     };
 
@@ -256,34 +253,40 @@ export class CTraderGateway {
       if (req.takeProfit != null) base.takeProfit = req.takeProfit;
     }
 
-    const res = await this.ctrader.send(
-      "PROTO_OA_NEW_ORDER_REQ",
-      base,
-      15_000,
-    );
+    const res = await this.ctrader.send("PROTO_OA_NEW_ORDER_REQ", base, 15_000, {
+      userId: req.userId,
+      env,
+      accountId,
+    });
 
-    this.logger.info(
-      { userId: req.userId, env, accountId, symbol: req.symbol, orderType, side },
-      "✅ Trade request sent",
-    );
+    const decoded = (res as any)?.decoded ?? res;
+    const payloadName = (res as any)?.payloadName ?? decoded?.payloadType;
+
+    // optional: fail fast instead of returning error response
+    if (payloadName === "PROTO_OA_ERROR_RES") {
+      const desc = String(decoded?.description ?? decoded?.message ?? "ORDER_ERROR");
+      throw new Error(desc);
+    }
+
+    this.logger.info({ userId: req.userId, env, accountId, symbol: req.symbol, orderType, side }, "✅ Trade request sent");
 
     return {
       request: { ...req, accountId, env, symbolId },
-      response: (res as any)?.decoded ?? res,
+      response: decoded,
     };
   }
 
   // ---------- helpers ----------
 
-  private async refreshSymbols(
-    userId: string,
-    env: CTraderEnv,
-    accountId: number,
-  ): Promise<Map<string, number>> {
+  private async refreshSymbols(userId: string, env: CTraderEnv, accountId: number): Promise<void> {
+    // requires account auth on same channel
+    await this.ensureAccountAuthorized(userId, env, accountId);
+
     const res = await this.ctrader.send(
       "PROTO_OA_SYMBOLS_LIST_REQ",
       { ctidTraderAccountId: accountId, includeArchivedSymbols: false },
       15_000,
+      { userId, env, accountId },
     );
 
     const decoded = (res as any)?.decoded ?? res;
@@ -296,22 +299,19 @@ export class CTraderGateway {
       if (name && Number.isFinite(id)) map.set(name, id);
     }
 
-    this.symbols.set(userId, env, accountId, map);
-    return map;
+    await this.symbolStore.replaceAll(userId, env, accountId, map);
   }
 
-  private async ensureSymbolId(
-    userId: string,
-    env: CTraderEnv,
-    accountId: number,
-    symbol: string,
-  ): Promise<number> {
+  private async ensureSymbolId(userId: string, env: CTraderEnv, accountId: number, symbol: string): Promise<number> {
     const sym = symbol.trim().toUpperCase();
 
-    let cache = this.symbols.get(userId, env, accountId);
-    if (!cache) cache = await this.refreshSymbols(userId, env, accountId);
+    let id = await this.symbolStore.getSymbolId(userId, env, accountId, sym);
+    if (id != null) return id;
 
-    const id = cache.get(sym);
+    // refresh and retry once
+    await this.refreshSymbols(userId, env, accountId);
+    id = await this.symbolStore.getSymbolId(userId, env, accountId, sym);
+
     if (id == null) throw new Error(`Symbol not found: ${symbol}`);
     return id;
   }

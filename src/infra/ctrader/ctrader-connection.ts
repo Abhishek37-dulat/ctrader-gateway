@@ -1,5 +1,6 @@
 // src/infra/ctrader/ctrader-connection.ts
 import net from "node:net";
+import tls from "node:tls";
 import { env } from "../../config/env.js";
 import type { Logger } from "../logger.js";
 import { Wire } from "./protobuf/wire.js";
@@ -20,7 +21,7 @@ export type SendMeta = Readonly<{
 }>;
 
 export class CTraderConnection {
-  private socket: net.Socket | null = null;
+  private socket: net.Socket | tls.TLSSocket | null = null;
   private acc: Buffer = Buffer.alloc(0);
 
   private connected = false;
@@ -37,10 +38,13 @@ export class CTraderConnection {
   private msgIdSeq = 1;
   private pending = new Map<string, Pending>();
 
-  // readiness promise so callers can await auth
   private readyResolve: (() => void) | null = null;
   private readyReject: ((e: Error) => void) | null = null;
   private readyPromise: Promise<void> = Promise.resolve();
+
+  // ---- Heartbeat ----
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private readonly heartbeatEveryMs = 9_000;
 
   constructor(
     private readonly logger: Logger,
@@ -55,11 +59,12 @@ export class CTraderConnection {
     this.shuttingDown = false;
     await this.proto.load();
     await this.connect(env.ctrader.env);
-    // do not await ready here; app will still boot, routes can call when needed
   }
 
   async stop(): Promise<void> {
     this.shuttingDown = true;
+
+    this.stopHeartbeat();
 
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
@@ -87,10 +92,6 @@ export class CTraderConnection {
     return this.connected && this.appAuthed;
   }
 
-  /**
-   * Ensures we are connected+authorized to the requested env.
-   * If env differs, we reconnect to that env (single-connection design).
-   */
   private async ensureReady(targetEnv: CTraderEnv): Promise<void> {
     if (this.shuttingDown) throw new Error("Shutting down");
 
@@ -103,7 +104,6 @@ export class CTraderConnection {
     }
 
     if (this.isReady()) return;
-    // Wait until connect/auth finishes
     await this.readyPromise;
   }
 
@@ -111,6 +111,10 @@ export class CTraderConnection {
     this.readyPromise = new Promise<void>((resolve, reject) => {
       this.readyResolve = resolve;
       this.readyReject = reject;
+    });
+
+    this.readyPromise.catch((err) => {
+      this.logger.warn({ err }, "readyPromise rejected");
     });
   }
 
@@ -127,12 +131,56 @@ export class CTraderConnection {
     this.resetReady();
   }
 
+  // ---- Heartbeat helpers ----
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    if (!this.isReady()) return;
+
+    this.heartbeatTimer = setInterval(() => {
+      this.sendHeartbeat();
+    }, this.heartbeatEveryMs);
+
+    this.heartbeatTimer.unref?.();
+    this.logger.debug({}, "💓 Heartbeat started");
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  private sendHeartbeat(): void {
+    if (this.shuttingDown) return;
+    if (!this.socket || !this.connected || !this.appAuthed) return;
+
+    try {
+      const payloadEnumKey = "PROTO_HEARTBEAT_EVENT";
+      const payloadTypeId = this.proto.payloadTypeId(payloadEnumKey);
+      const typeName = this.proto.messageTypeFromPayloadName(payloadEnumKey);
+
+      const payloadBytes = this.proto.encodeMessage(typeName, {
+        payloadType: payloadTypeId,
+      });
+
+      // Heartbeat is one-way; no clientMsgId needed
+      const wrapperBytes = this.proto.encodeProtoMessage(payloadTypeId, payloadBytes);
+      const framed = Wire.frame(wrapperBytes);
+
+      this.socket.write(framed);
+      this.logger.debug({ payloadEnumKey }, "➡️ cTrader heartbeat");
+    } catch (err) {
+      this.logger.debug({ err }, "heartbeat encode/send failed");
+    }
+  }
+
   // ---- Connection lifecycle ----
 
   private async forceReconnect(targetEnv: CTraderEnv): Promise<void> {
-    // stop only socket (do not set shuttingDown)
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+
+    this.stopHeartbeat();
 
     this.connected = false;
     this.appAuthed = false;
@@ -147,7 +195,7 @@ export class CTraderConnection {
     }
 
     await this.connect(targetEnv);
-    await this.readyPromise; // wait for auth
+    await this.readyPromise;
   }
 
   private failPending(err: Error): void {
@@ -169,7 +217,7 @@ export class CTraderConnection {
 
     this.logger.info({ host, port, targetEnv }, "🔌 Connecting to cTrader...");
 
-    // clean old socket (if any)
+    this.stopHeartbeat();
     if (this.socket) {
       this.socket.removeAllListeners();
       this.socket.destroy();
@@ -179,21 +227,32 @@ export class CTraderConnection {
     this.connected = false;
     this.appAuthed = false;
 
-    // reset readiness for this connection attempt
     this.resetReady();
 
-    const sock = new net.Socket();
+    const sock = tls.connect({
+      host,
+      port,
+      servername: host,
+    });
+
     this.socket = sock;
 
     sock.setNoDelay(true);
+    sock.setKeepAlive(true, 30_000);
 
     sock.on("data", (chunk: Buffer) => this.onData(chunk));
 
     sock.on("error", (err: unknown) => {
-      this.logger.error({ err }, "❌ TCP error");
+      this.stopHeartbeat();
+      this.logger.error({ err }, "❌ TCP/TLS error");
+      try {
+        sock.destroy();
+      } catch {}
     });
 
     sock.on("close", () => {
+      this.stopHeartbeat();
+
       this.logger.warn({}, "🔌 TCP closed");
       this.connected = false;
       this.appAuthed = false;
@@ -205,17 +264,20 @@ export class CTraderConnection {
       this.scheduleReconnect();
     });
 
-    sock.on("connect", async () => {
+    sock.on("secureConnect", async () => {
       this.connected = true;
       this.backoffMs = 500;
-      this.logger.info({ host, port }, `✅ Connected to ${host}:${port}`);
+      this.logger.info({ host, port }, `✅ TLS connected to ${host}:${port}`);
 
       try {
         await this.appAuth();
         this.appAuthed = true;
         this.connectInFlight = false;
+
         this.succeedReady();
         this.logger.info({}, "✅ Application authorized");
+
+        this.startHeartbeat();
       } catch (e: unknown) {
         this.connectInFlight = false;
         this.logger.error({ err: e }, "❌ AppAuth failed");
@@ -227,8 +289,6 @@ export class CTraderConnection {
         this.scheduleReconnect();
       }
     });
-
-    sock.connect(port, host);
   }
 
   private scheduleReconnect(): void {
@@ -242,7 +302,6 @@ export class CTraderConnection {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
 
-      // if another connect/auth still running, try later
       if (this.connectInFlight) {
         this.scheduleReconnect();
         return;
@@ -254,9 +313,6 @@ export class CTraderConnection {
 
   // ---- Send/Receive ----
 
-  /**
-   * Send a request. `meta` is optional and used for logging + env switching.
-   */
   async send(
     payloadEnumKey: string,
     obj: any,
@@ -264,14 +320,18 @@ export class CTraderConnection {
     meta?: SendMeta,
   ): Promise<any> {
     const targetEnv = meta?.env ?? env.ctrader.env;
-    await this.ensureReady(targetEnv);
-
-    if (!this.socket || !this.connected) throw new Error("Not connected");
-
-    // ✅ allow AppAuth request before appAuthed is true
     const isAppAuth = payloadEnumKey === "PROTO_OA_APPLICATION_AUTH_REQ";
-    if (!this.appAuthed && !isAppAuth) {
-      throw new Error("App not authorized yet");
+
+    if (!isAppAuth) {
+      await this.ensureReady(targetEnv);
+    } else {
+      if (!this.socket || !this.connected) {
+        throw new Error("Not connected");
+      }
+    }
+
+    if (!this.socket || !this.connected) {
+      throw new Error("Not connected");
     }
 
     const payloadTypeId = this.proto.payloadTypeId(payloadEnumKey);
@@ -281,14 +341,12 @@ export class CTraderConnection {
     const reqObj = this.attachClientMsgId(typeName, obj, clientMsgId);
 
     const payloadBytes = this.proto.encodeMessage(typeName, reqObj);
-    const wrapperBytes = this.proto.encodeProtoMessage(
-      payloadTypeId,
-      payloadBytes,
-    );
+
+    // ✅ IMPORTANT: include clientMsgId in the ProtoMessage wrapper for correlation
+    const wrapperBytes = this.proto.encodeProtoMessage(payloadTypeId, payloadBytes, clientMsgId);
 
     const framed = Wire.frame(wrapperBytes);
 
-    // best-effort log
     this.logger.debug(
       {
         payloadEnumKey,
@@ -305,11 +363,7 @@ export class CTraderConnection {
     return await new Promise<any>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(clientMsgId);
-        reject(
-          new Error(
-            `Request timeout (${payloadEnumKey}) clientMsgId=${clientMsgId}`,
-          ),
-        );
+        reject(new Error(`Request timeout (${payloadEnumKey}) clientMsgId=${clientMsgId}`));
       }, timeoutMs);
 
       this.pending.set(clientMsgId, { resolve, reject, timeout });
@@ -323,13 +377,22 @@ export class CTraderConnection {
 
     for (const frame of frames) {
       try {
-        const { payloadType, payload } = this.proto.decodeProtoMessage(frame);
+        const { payloadType, payload, clientMsgId } = this.proto.decodeProtoMessage(frame);
 
-        const payloadName = this.proto.payloadTypeName(payloadType);
+        let payloadName: string;
+        try {
+          payloadName = this.proto.payloadTypeName(payloadType);
+        } catch {
+          this.logger.debug({ payloadType }, "📩 Received unknown payload type (likely heartbeat)");
+          continue;
+        }
+
         const typeName = this.proto.messageTypeFromPayloadName(payloadName);
         const decoded = this.proto.decodeMessage(typeName, payload);
 
-        const id = this.extractClientMsgId(decoded);
+        // ✅ prefer wrapper clientMsgId; fallback to payload field
+        const id = clientMsgId ?? this.extractClientMsgId(decoded);
+
         if (id && this.pending.has(id)) {
           const p = this.pending.get(id)!;
           clearTimeout(p.timeout);
@@ -338,7 +401,25 @@ export class CTraderConnection {
           continue;
         }
 
-        // async events (spot/order/error). You’ll route these later to QuoteBus.
+        // Handle system responses that might not echo clientMsgId
+        if (
+          payloadName === "PROTO_OA_APPLICATION_AUTH_RES" ||
+          payloadName === "PROTO_OA_ERROR_RES" ||
+          payloadName === "PROTO_OA_ACCOUNT_AUTH_RES"
+        ) {
+          for (const [msgId, pending] of this.pending) {
+            clearTimeout(pending.timeout);
+            this.pending.delete(msgId);
+            pending.resolve({ payloadName, typeName, decoded });
+            this.logger.debug(
+              { payloadName, matchedMsgId: msgId },
+              "📩 system response matched to pending request",
+            );
+            break;
+          }
+          continue;
+        }
+
         this.logger.debug({ payloadName }, "📩 event received");
       } catch (e: unknown) {
         this.logger.error({ err: e }, "❌ Failed to decode incoming frame");
@@ -349,7 +430,8 @@ export class CTraderConnection {
   // ---- AppAuth ----
 
   private async appAuth(): Promise<void> {
-    // IMPORTANT: call send with AppAuth payloadEnumKey so it bypasses appAuthed guard
+    this.logger.info({}, "🔐 Sending AppAuth to cTrader");
+
     const res = await this.send(
       "PROTO_OA_APPLICATION_AUTH_REQ",
       {
@@ -368,7 +450,6 @@ export class CTraderConnection {
       throw new Error(`AppAuth error: ${msg}`);
     }
 
-    // If it isn't error, assume ok (ProtoOAApplicationAuthRes)
     if (!decoded) throw new Error("Empty auth response");
   }
 
@@ -380,11 +461,7 @@ export class CTraderConnection {
     return this.msgIdSeq;
   }
 
-  private attachClientMsgId(
-    typeName: string,
-    obj: any,
-    clientMsgId: string,
-  ): any {
+  private attachClientMsgId(typeName: string, obj: any, clientMsgId: string): any {
     if (this.proto.hasField(typeName, "clientMsgId")) {
       return { ...obj, clientMsgId };
     }
